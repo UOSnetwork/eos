@@ -1136,7 +1136,7 @@ struct vote_calcs_subcommand {
       auto vote_calcs = actionRoot->add_subcommand("calcs", localized("Vote for one or more calcs"));
       vote_calcs->add_option("voter", voter_str, localized("The voting account"))->required();
       vote_calcs->add_option("calculators", calc_names, localized("The account(s) to vote for. All options from this position and following will be treated as the calc list."))->required();
-      add_standard_transaction_options(vote_producers, "voter@active");
+      add_standard_transaction_options(vote_calcs, "voter@active");
 
       vote_calcs->set_callback([this] {
 

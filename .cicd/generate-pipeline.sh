@@ -3,9 +3,10 @@ set -eo pipefail
 # environment
 . ./.cicd/helpers/general.sh
 export MOJAVE_ANKA_TAG_BASE=${MOJAVE_ANKA_TAG_BASE:-'clean::cicd::git-ssh::nas::brew::buildkite-agent'}
-export MOJAVE_ANKA_TEMPLATE_NAME=${MOJAVE_ANKA_TEMPLATE_NAME:-'10.14.4_6C_14G_40G'}
+export MOJAVE_ANKA_TEMPLATE_NAME=${MOJAVE_ANKA_TEMPLATE_NAME:-'10.14.6_6C_14G_40G'}
 export PLATFORMS_JSON_ARRAY='[]'
-
+BUILDKITE_BUILD_AGENT_QUEUE='automation-eks-eos-builder-fleet'
+BUILDKITE_TEST_AGENT_QUEUE='automation-eks-eos-tester-fleet'
 # Determine if it's a forked PR and make sure to add git fetch so we don't have to git clone the forked repo's url
 if [[ $BUILDKITE_BRANCH =~ ^pull/[0-9]+/head: ]]; then
   PR_ID=$(echo $BUILDKITE_BRANCH | cut -d/ -f2)
@@ -13,25 +14,39 @@ if [[ $BUILDKITE_BRANCH =~ ^pull/[0-9]+/head: ]]; then
 fi
 
 [[ -z "$ROUNDS" ]] && export ROUNDS='1'
-# read .cicd/platforms
-for FILE in $(ls $CICD_DIR/platforms); do
+# Determine which dockerfiles/scripts to use for the pipeline.
+if [[ $PINNED == false ]]; then
+    export PLATFORM_TYPE="unpinned"
+else
+    export PLATFORM_TYPE="pinned"
+fi
+for FILE in $(ls $CICD_DIR/platforms/$PLATFORM_TYPE); do
     # skip mac or linux by not even creating the json block
     ( [[ $SKIP_MAC == true ]] && [[ $FILE =~ 'macos' ]] ) && continue
     ( [[ $SKIP_LINUX == true ]] && [[ ! $FILE =~ 'macos' ]] ) && continue
     # use pinned or unpinned, not both sets of platform files
-    if [[ $PINNED == false || $UNPINNED == true ]] && [[ ! $FILE =~ 'macos' ]]; then
+    if [[ $PINNED == false ]]; then
         export SKIP_CONTRACT_BUILDER=${SKIP_CONTRACT_BUILDER:-true}
         export SKIP_PACKAGE_BUILDER=${SKIP_PACKAGE_BUILDER:-true}
-        [[ ! $FILE =~ 'unpinned' ]] && continue
-    else
-        [[ $FILE =~ 'unpinned' ]] && continue
     fi
     export FILE_NAME="$(echo $FILE | awk '{split($0,a,/\.(d|s)/); print a[1] }')"
+    # macos-10.14
+    # ubuntu-16.04
     export PLATFORM_NAME="$(echo $FILE_NAME | cut -d- -f1 | sed 's/os/OS/g')"
+    # macOS
+    # ubuntu
     export PLATFORM_NAME_UPCASE="$(echo $PLATFORM_NAME | tr a-z A-Z)"
+    # MACOS
+    # UBUNTU
     export VERSION_MAJOR="$(echo $FILE_NAME | cut -d- -f2 | cut -d. -f1)"
+    # 10
+    # 16
     [[ "$(echo $FILE_NAME | cut -d- -f2)" =~ '.' ]] && export VERSION_MINOR="_$(echo $FILE_NAME | cut -d- -f2 | cut -d. -f2)" || export VERSION_MINOR=''
+    # _14
+    # _04
     export VERSION_FULL="$(echo $FILE_NAME | cut -d- -f2)"
+    # 10.14
+    # 16.04
     OLDIFS=$IFS
     IFS='_'
     set $PLATFORM_NAME
@@ -41,7 +56,7 @@ for FILE in $(ls $CICD_DIR/platforms); do
     [[ $FILE_NAME =~ 'ubuntu' ]] && export ICON=':ubuntu:'
     [[ $FILE_NAME =~ 'centos' ]] && export ICON=':centos:'
     [[ $FILE_NAME =~ 'macos' ]] && export ICON=':darwin:'
-    . $HELPERS_DIR/file-hash.sh $CICD_DIR/platforms/$FILE # returns HASHED_IMAGE_TAG, etc
+    . $HELPERS_DIR/file-hash.sh $CICD_DIR/platforms/$PLATFORM_TYPE/$FILE # returns HASHED_IMAGE_TAG, etc
     export PLATFORMS_JSON_ARRAY=$(echo $PLATFORMS_JSON_ARRAY | jq -c '. += [{ 
         "FILE_NAME": env.FILE_NAME, 
         "PLATFORM_NAME": env.PLATFORM_NAME,
@@ -62,39 +77,12 @@ fi
 export BUILD_SOURCE=${BUILD_SOURCE:---build \$BUILDKITE_BUILD_ID}
 # set trigger_job if master/release/develop branch and webhook
 if [[ $BUILDKITE_BRANCH =~ ^release/[0-9]+\.[0-9]+\.x$ || $BUILDKITE_BRANCH =~ ^master$ || $BUILDKITE_BRANCH =~ ^develop$ ]]; then
-    [[ $BUILDKITE_SOURCE == 'webhook' ]] && export TRIGGER_JOB=true
+    [[ $BUILDKITE_SOURCE != 'scheduled' ]] && export TRIGGER_JOB=true
 fi
 oIFS="$IFS"
 IFS=$''
 nIFS=$IFS # fix array splitting (\n won't work)
 # start with a wait step
-echo '  - wait'
-echo ''
-# base-image steps
-echo '    # base-images'
-echo $PLATFORMS_JSON_ARRAY | jq -cr '.[]' | while read -r PLATFORM_JSON; do
-    if [[ "$(echo "$PLATFORM_JSON" | jq -r .FILE_NAME)" =~ 'macos' ]]; then
-        cat <<EOF
-  - label: "$(echo "$PLATFORM_JSON" | jq -r .ICON) Anka - Ensure $(echo "$PLATFORM_JSON" | jq -r .PLATFORM_NAME_FULL) Template Dependency Tag"
-    command:
-      - "git clone git@github.com:EOSIO/mac-anka-fleet.git"
-      - "cd mac-anka-fleet && . ./ensure_tag.bash -u 12 -r 25G -a '-n'"
-    agents: "queue=mac-anka-templater-fleet"
-    env:
-      REPO: ${BUILDKITE_PULL_REQUEST_REPO:-$BUILDKITE_REPO}
-      REPO_COMMIT: $BUILDKITE_COMMIT
-      TEMPLATE: $MOJAVE_ANKA_TEMPLATE_NAME
-      TEMPLATE_TAG: $MOJAVE_ANKA_TAG_BASE
-      PINNED: $PINNED
-      UNPINNED: $UNPINNED
-      TAG_COMMANDS: "git clone ${BUILDKITE_PULL_REQUEST_REPO:-$BUILDKITE_REPO} eos && cd eos && $GIT_FETCH git checkout -f $BUILDKITE_COMMIT && git submodule update --init --recursive && export PINNED=$PINNED && export UNPINNED=$UNPINNED && . ./.cicd/platforms/macos-10.14.sh && cd ~/eos && cd .. && rm -rf eos"
-      PROJECT_TAG: $(echo "$PLATFORM_JSON" | jq -r .HASHED_IMAGE_TAG)
-    timeout: ${TIMEOUT:-320}
-    skip: \${SKIP_$(echo "$PLATFORM_JSON" | jq -r .PLATFORM_NAME_UPCASE)_$(echo "$PLATFORM_JSON" | jq -r .VERSION_MAJOR)$(echo "$PLATFORM_JSON" | jq -r .VERSION_MINOR)}\${SKIP_ENSURE_$(echo "$PLATFORM_JSON" | jq -r .PLATFORM_NAME_UPCASE)_$(echo "$PLATFORM_JSON" | jq -r .VERSION_MAJOR)$(echo "$PLATFORM_JSON" | jq -r .VERSION_MINOR)}
-
-EOF
-    fi
-done
 echo '  - wait'
 echo ''
 # build steps
@@ -108,9 +96,9 @@ echo $PLATFORMS_JSON_ARRAY | jq -cr '.[]' | while read -r PLATFORM_JSON; do
       - "tar -pczf build.tar.gz build && buildkite-agent artifact upload build.tar.gz"
     env:
       IMAGE_TAG: $(echo "$PLATFORM_JSON" | jq -r .FILE_NAME)
-      BUILDKITE_AGENT_ACCESS_TOKEN:
+      PLATFORM_TYPE: $PLATFORM_TYPE
     agents:
-      queue: "automation-eos-builder-fleet"
+      queue: "$BUILDKITE_BUILD_AGENT_QUEUE"
     timeout: ${TIMEOUT:-180}
     skip: \${SKIP_$(echo "$PLATFORM_JSON" | jq -r .PLATFORM_NAME_UPCASE)_$(echo "$PLATFORM_JSON" | jq -r .VERSION_MAJOR)$(echo "$PLATFORM_JSON" | jq -r .VERSION_MINOR)}${SKIP_BUILD}
 
@@ -123,7 +111,7 @@ EOF
       - "cd eos && ./.cicd/build.sh"
       - "cd eos && tar -pczf build.tar.gz build && buildkite-agent artifact upload build.tar.gz"
     plugins:
-      - chef/anka#v0.5.4:
+      - chef/anka#v0.5.5:
           no-volume: true
           inherit-environment-vars: true
           vm-name: ${MOJAVE_ANKA_TEMPLATE_NAME}
@@ -136,11 +124,21 @@ EOF
           failover-registries:
             - 'registry_1'
             - 'registry_2'
-          pre-execute-sleep: 5
+          pre-execute-sleep: 10
+          pre-commands: 
+            - "git clone git@github.com:EOSIO/mac-anka-fleet.git && cd mac-anka-fleet && . ./ensure-tag.bash -u 12 -r 25G -a '-n'"
+    env:
+      REPO: ${BUILDKITE_PULL_REQUEST_REPO:-$BUILDKITE_REPO}
+      REPO_COMMIT: $BUILDKITE_COMMIT
+      TEMPLATE: $MOJAVE_ANKA_TEMPLATE_NAME
+      TEMPLATE_TAG: $MOJAVE_ANKA_TAG_BASE
+      IMAGE_TAG: $(echo "$PLATFORM_JSON" | jq -r .FILE_NAME)
+      PLATFORM_TYPE: $PLATFORM_TYPE
+      TAG_COMMANDS: "git clone ${BUILDKITE_PULL_REQUEST_REPO:-$BUILDKITE_REPO} eos && cd eos && $GIT_FETCH git checkout -f $BUILDKITE_COMMIT && git submodule update --init --recursive && export IMAGE_TAG=$(echo "$PLATFORM_JSON" | jq -r .FILE_NAME) && export PLATFORM_TYPE=$PLATFORM_TYPE && . ./.cicd/platforms/$PLATFORM_TYPE/$(echo "$PLATFORM_JSON" | jq -r .FILE_NAME).sh && cd ~/eos && cd .. && rm -rf eos"
+      PROJECT_TAG: $(echo "$PLATFORM_JSON" | jq -r .HASHED_IMAGE_TAG)
     timeout: ${TIMEOUT:-180}
     agents: "queue=mac-anka-large-node-fleet"
     skip: \${SKIP_$(echo "$PLATFORM_JSON" | jq -r .PLATFORM_NAME_UPCASE)_$(echo "$PLATFORM_JSON" | jq -r .VERSION_MAJOR)$(echo "$PLATFORM_JSON" | jq -r .VERSION_MINOR)}${SKIP_BUILD}
-
 EOF
     fi
 done
@@ -162,9 +160,12 @@ for ROUND in $(seq 1 $ROUNDS); do
       - "./.cicd/test.sh scripts/parallel-test.sh"
     env:
       IMAGE_TAG: $(echo "$PLATFORM_JSON" | jq -r .FILE_NAME)
-      BUILDKITE_AGENT_ACCESS_TOKEN:
+      PLATFORM_TYPE: $PLATFORM_TYPE
     agents:
-      queue: "automation-eos-builder-fleet"
+      queue: "$BUILDKITE_BUILD_AGENT_QUEUE"
+    retry:
+      manual:
+        permit_on_passed: true
     timeout: ${TIMEOUT:-10}
     skip: \${SKIP_$(echo "$PLATFORM_JSON" | jq -r .PLATFORM_NAME_UPCASE)_$(echo "$PLATFORM_JSON" | jq -r .VERSION_MAJOR)$(echo "$PLATFORM_JSON" | jq -r .VERSION_MINOR)}${SKIP_UNIT_TESTS}
 
@@ -188,9 +189,12 @@ EOF
           failover-registries:
             - 'registry_1'
             - 'registry_2'
-          pre-execute-sleep: 5
-    timeout: ${TIMEOUT:-20}
+          pre-execute-sleep: 10
     agents: "queue=mac-anka-node-fleet"
+    retry:
+      manual:
+        permit_on_passed: true
+    timeout: ${TIMEOUT:-60}
     skip: \${SKIP_$(echo "$PLATFORM_JSON" | jq -r .PLATFORM_NAME_UPCASE)_$(echo "$PLATFORM_JSON" | jq -r .VERSION_MAJOR)$(echo "$PLATFORM_JSON" | jq -r .VERSION_MINOR)}${SKIP_UNIT_TESTS}
 
 EOF
@@ -210,9 +214,12 @@ EOF
       - "./.cicd/test.sh scripts/serial-test.sh $TEST_NAME"
     env:
       IMAGE_TAG: $(echo "$PLATFORM_JSON" | jq -r .FILE_NAME)
-      BUILDKITE_AGENT_ACCESS_TOKEN:
+      PLATFORM_TYPE: $PLATFORM_TYPE
     agents:
-      queue: "automation-eos-builder-fleet"
+      queue: "$BUILDKITE_TEST_AGENT_QUEUE"
+    retry:
+      manual:
+        permit_on_passed: true
     timeout: ${TIMEOUT:-20}
     skip: \${SKIP_$(echo "$PLATFORM_JSON" | jq -r .PLATFORM_NAME_UPCASE)_$(echo "$PLATFORM_JSON" | jq -r .VERSION_MAJOR)$(echo "$PLATFORM_JSON" | jq -r .VERSION_MINOR)}${SKIP_SERIAL_TESTS}
 
@@ -236,9 +243,12 @@ EOF
           failover-registries:
             - 'registry_1'
             - 'registry_2'
-          pre-execute-sleep: 5
-    timeout: ${TIMEOUT:-20}
+          pre-execute-sleep: 10
     agents: "queue=mac-anka-node-fleet"
+    retry:
+      manual:
+        permit_on_passed: true
+    timeout: ${TIMEOUT:-60}
     skip: \${SKIP_$(echo "$PLATFORM_JSON" | jq -r .PLATFORM_NAME_UPCASE)_$(echo "$PLATFORM_JSON" | jq -r .VERSION_MAJOR)$(echo "$PLATFORM_JSON" | jq -r .VERSION_MINOR)}${SKIP_SERIAL_TESTS}
 
 EOF
@@ -260,9 +270,12 @@ EOF
       - "./.cicd/test.sh scripts/long-running-test.sh $TEST_NAME"
     env:
       IMAGE_TAG: $(echo "$PLATFORM_JSON" | jq -r .FILE_NAME)
-      BUILDKITE_AGENT_ACCESS_TOKEN:
+      PLATFORM_TYPE: $PLATFORM_TYPE
     agents:
-      queue: "automation-eos-builder-fleet"
+      queue: "$BUILDKITE_TEST_AGENT_QUEUE"
+    retry:
+      manual:
+        permit_on_passed: true
     timeout: ${TIMEOUT:-180}
     skip: \${SKIP_$(echo "$PLATFORM_JSON" | jq -r .PLATFORM_NAME_UPCASE)_$(echo "$PLATFORM_JSON" | jq -r .VERSION_MAJOR)$(echo "$PLATFORM_JSON" | jq -r .VERSION_MINOR)}${SKIP_LONG_RUNNING_TESTS:-true}
 
@@ -286,9 +299,12 @@ EOF
           failover-registries:
             - 'registry_1'
             - 'registry_2'
-          pre-execute-sleep: 5
-    timeout: ${TIMEOUT:-180}
+          pre-execute-sleep: 10
     agents: "queue=mac-anka-node-fleet"
+    retry:
+      manual:
+        permit_on_passed: true
+    timeout: ${TIMEOUT:-180}
     skip: \${SKIP_$(echo "$PLATFORM_JSON" | jq -r .PLATFORM_NAME_UPCASE)_$(echo "$PLATFORM_JSON" | jq -r .VERSION_MAJOR)$(echo "$PLATFORM_JSON" | jq -r .VERSION_MINOR)}${SKIP_LONG_RUNNING_TESTS:-true}
 
 EOF
@@ -304,7 +320,7 @@ EOF
 done
 # trigger eosio-lrt post pr
 if [[ -z $BUILDKITE_TRIGGERED_FROM_BUILD_ID && $TRIGGER_JOB == "true" ]]; then
-    if ( [[ ! $PINNED == false || $UNPINNED == true ]] ); then
+    if ( [[ ! $PINNED == false ]] ); then
     cat <<EOF
   - label: ":pipeline: Trigger Long Running Tests"
     trigger: "eosio-lrt"
@@ -319,14 +335,13 @@ if [[ -z $BUILDKITE_TRIGGERED_FROM_BUILD_ID && $TRIGGER_JOB == "true" ]]; then
         BUILDKITE_PULL_REQUEST_REPO: "${BUILDKITE_PULL_REQUEST_REPO}"
         SKIP_BUILD: "true"
         PINNED: "${PINNED}"
-        UNPINNED: "${UNPINNED}"
 
 EOF
     fi
 fi
 # trigger multiversion post pr
 if [[ -z $BUILDKITE_TRIGGERED_FROM_BUILD_ID && $TRIGGER_JOB = "true" ]]; then
-    if ( [[ ! $PINNED == false || $UNPINNED == true ]] ); then
+    if ( [[ ! $PINNED == false ]] ); then
     cat <<EOF
   - label: ":pipeline: Trigger Multiversion Test"
     trigger: "eos-multiversion-tests"
@@ -355,38 +370,38 @@ cat <<EOF
       echo '+++ :javascript: Running test-metrics.js'
       node --max-old-space-size=32768 test-metrics.js
     agents:
-      queue: "automation-eos-builder-fleet"
+      queue: "$BUILDKITE_TEST_AGENT_QUEUE"
     timeout: ${TIMEOUT:-10}
     soft_fail: true
 
   - wait
 
     # packaging
-  - label: ":centos: CentOS 7.6 - Package Builder"
+  - label: ":centos: CentOS 7.7 - Package Builder"
     command:
-      - "buildkite-agent artifact download build.tar.gz . --step ':centos: CentOS 7.6 - Build' --agent-access-token \$\$BUILDKITE_AGENT_ACCESS_TOKEN && tar -xzf build.tar.gz"
+      - "buildkite-agent artifact download build.tar.gz . --step ':centos: CentOS 7.7 - Build' --agent-access-token \$\$BUILDKITE_AGENT_ACCESS_TOKEN && tar -xzf build.tar.gz"
       - "./.cicd/package.sh"
     env:
-      IMAGE_TAG: "centos-7.6"
-      BUILDKITE_AGENT_ACCESS_TOKEN:
+      IMAGE_TAG: "centos-7.7-$PLATFORM_TYPE"
+      PLATFORM_TYPE: $PLATFORM_TYPE
       OS: "el7" # OS and PKGTYPE required for lambdas
       PKGTYPE: "rpm"
     agents:
-      queue: "automation-eos-builder-fleet"
+      queue: "$BUILDKITE_TEST_AGENT_QUEUE"
     timeout: ${TIMEOUT:-10}
-    skip: ${SKIP_CENTOS_7_6}${SKIP_PACKAGE_BUILDER}${SKIP_LINUX}
+    skip: ${SKIP_CENTOS_7_7}${SKIP_PACKAGE_BUILDER}${SKIP_LINUX}
 
   - label: ":ubuntu: Ubuntu 16.04 - Package Builder"
     command:
       - "buildkite-agent artifact download build.tar.gz . --step ':ubuntu: Ubuntu 16.04 - Build' --agent-access-token \$\$BUILDKITE_AGENT_ACCESS_TOKEN && tar -xzf build.tar.gz"
       - "./.cicd/package.sh"
     env:
-      IMAGE_TAG: "ubuntu-16.04"
-      BUILDKITE_AGENT_ACCESS_TOKEN:
+      IMAGE_TAG: "ubuntu-16.04-$PLATFORM_TYPE"
+      PLATFORM_TYPE: $PLATFORM_TYPE
       OS: "ubuntu-16.04" # OS and PKGTYPE required for lambdas
       PKGTYPE: "deb"
     agents:
-      queue: "automation-eos-builder-fleet"
+      queue: "$BUILDKITE_TEST_AGENT_QUEUE"
     timeout: ${TIMEOUT:-10}
     skip: ${SKIP_UBUNTU_16_04}${SKIP_PACKAGE_BUILDER}${SKIP_LINUX}
 
@@ -395,12 +410,12 @@ cat <<EOF
       - "buildkite-agent artifact download build.tar.gz . --step ':ubuntu: Ubuntu 18.04 - Build' --agent-access-token \$\$BUILDKITE_AGENT_ACCESS_TOKEN && tar -xzf build.tar.gz"
       - "./.cicd/package.sh"
     env:
-      IMAGE_TAG: "ubuntu-18.04"
-      BUILDKITE_AGENT_ACCESS_TOKEN:
+      IMAGE_TAG: "ubuntu-18.04-$PLATFORM_TYPE"
+      PLATFORM_TYPE: $PLATFORM_TYPE
       OS: "ubuntu-18.04" # OS and PKGTYPE required for lambdas
       PKGTYPE: "deb"
     agents:
-      queue: "automation-eos-builder-fleet"
+      queue: "$BUILDKITE_TEST_AGENT_QUEUE"
     timeout: ${TIMEOUT:-10}
     skip: ${SKIP_UBUNTU_18_04}${SKIP_PACKAGE_BUILDER}${SKIP_LINUX}
 
@@ -413,7 +428,7 @@ cat <<EOF
       - chef/anka#v0.5.4:
           no-volume: true
           inherit-environment-vars: true
-          vm-name: 10.14.4_6C_14G_40G
+          vm-name: 10.14.6_6C_14G_40G
           vm-registry-tag: "clean::cicd::git-ssh::nas::brew::buildkite-agent"
           always-pull: true
           debug: true
@@ -421,19 +436,19 @@ cat <<EOF
           failover-registries:
             - 'registry_1'
             - 'registry_2'
-          pre-execute-sleep: 5
+          pre-execute-sleep: 10
     agents:
       - "queue=mac-anka-node-fleet"
-    timeout: ${TIMEOUT:-10}
+    timeout: ${TIMEOUT:-60}
     skip: ${SKIP_MACOS_10_14}${SKIP_PACKAGE_BUILDER}${SKIP_MAC}
 
   - label: ":ubuntu: Ubuntu 18.04 - Contract Builder"
     command: "./.cicd/installation-build.sh"
     env:
       IMAGE_TAG: "ubuntu-18.04-unpinned"
-      BUILDKITE_AGENT_ACCESS_TOKEN:
+      PLATFORM_TYPE: "unpinned"
     agents:
-      queue: "automation-eos-builder-fleet"
+      queue: "$BUILDKITE_BUILD_AGENT_QUEUE"
     timeout: ${TIMEOUT:-30}
     skip: ${SKIP_CONTRACT_BUILDER}${SKIP_LINUX}
 
